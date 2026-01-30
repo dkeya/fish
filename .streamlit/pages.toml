@@ -1,0 +1,34 @@
+[[pages]]
+path = "app.py"
+name = "Home"
+icon = "🏠"
+
+[[pages]]
+path = "pages/1_📥_Batch_Receipt.py"
+name = "Production Run"
+icon = "🏭"
+
+[[pages]]
+path = "pages/2_📦_Inventory.py"
+name = "Inventory"
+icon = "📦"
+
+[[pages]]
+path = "pages/3_🛒_Sales.py"
+name = "Sales"
+icon = "🛒"
+
+[[pages]]
+path = "pages/4_✅_Batch_Close_&_Loss.py"
+name = "Batch Close & Loss"
+icon = "✅"
+
+[[pages]]
+path = "pages/5_🧪_Data_Management.py"
+name = "Data Management"
+icon = "🧪"
+
+[[pages]]
+path = "pages/6_📊_Reports.py"
+name = "Reports"
+icon = "📊"
