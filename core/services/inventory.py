@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+from typing import Any
+
 from core.db import q
 
 
 def batch_on_hand(conn, batch_id: int) -> dict:
+    """
+    Batch-level on-hand (existing behavior).
+    Uses batches.initial_* and subtracts ALL sales against the batch (regardless of size_id),
+    then applies inventory_adjustments at batch level.
+    """
     b = q(conn, "SELECT * FROM batches WHERE id=?", (batch_id,))
     if not b:
         return {"pcs": 0, "kg": 0.0}
@@ -23,6 +30,101 @@ def batch_on_hand(conn, batch_id: int) -> dict:
     pcs = int(b["initial_pieces"]) - int(sold["pcs"]) + int(adj["pcs"])
     kg = float(b["initial_kg"]) - float(sold["kg"]) + float(adj["kg"])
     return {"pcs": pcs, "kg": kg}
+
+
+def batch_line_on_hand(conn, batch_id: int, size_id: int) -> dict:
+    """
+    Size-level on-hand inside a batch.
+
+    This is FIFO-ready: it treats batch_lines (per size) as the initial stock,
+    then subtracts sales for the same batch+size_id.
+
+    NOTE:
+    - This relies on sales.size_id being set correctly. If sales.size_id is NULL,
+      those sales won't be attributed to any size here.
+    - inventory_adjustments are currently batch-level (no size_id), so they are not
+      allocated to size lines here.
+    """
+    bl = q(
+        conn,
+        """
+        SELECT pieces, kg
+        FROM batch_lines
+        WHERE batch_id=? AND size_id=?
+        """,
+        (batch_id, size_id),
+    )
+    if not bl:
+        return {"pcs": 0, "kg": 0.0}
+
+    bl = bl[0]
+    initial_pcs = int(bl["pieces"])
+    initial_kg = float(bl["kg"])
+
+    sold = q(
+        conn,
+        """
+        SELECT
+          COALESCE(SUM(pcs_sold),0) AS pcs,
+          COALESCE(SUM(kg_sold),0) AS kg
+        FROM sales
+        WHERE batch_id=? AND size_id=?
+        """,
+        (batch_id, size_id),
+    )[0]
+
+    pcs = initial_pcs - int(sold["pcs"])
+    kg = initial_kg - float(sold["kg"])
+    return {"pcs": pcs, "kg": kg}
+
+
+def fifo_batches_for_size(conn, *, branch_id: int, size_id: int) -> list[dict[str, Any]]:
+    """
+    FIFO helper: returns OPEN batches for a branch+size, ordered oldest-first,
+    with size-level pcs/kg on-hand (based on batch_lines and sales for that size).
+
+    Sales page will use this to auto-pick batches instead of user selection.
+    """
+    rows = q(
+        conn,
+        """
+        SELECT
+          b.id AS batch_id,
+          b.batch_code,
+          b.receipt_date,
+          b.branch_id,
+          b.buy_price_per_kg,
+          b.batch_avg_kg_per_piece,
+          bl.pieces AS initial_pcs,
+          bl.kg AS initial_kg
+        FROM batches b
+        JOIN batch_lines bl ON bl.batch_id = b.id
+        WHERE b.status='OPEN'
+          AND b.branch_id=?
+          AND bl.size_id=?
+        ORDER BY b.receipt_date ASC, b.id ASC
+        """,
+        (int(branch_id), int(size_id)),
+    )
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        onhand = batch_line_on_hand(conn, int(r["batch_id"]), int(size_id))
+        # Only return batches that still have stock on-hand for that size
+        if onhand["pcs"] > 0 and onhand["kg"] > 0:
+            out.append(
+                {
+                    "batch_id": int(r["batch_id"]),
+                    "batch_code": str(r["batch_code"]),
+                    "receipt_date": str(r["receipt_date"]),
+                    "branch_id": int(r["branch_id"]),
+                    "buy_price_per_kg": float(r["buy_price_per_kg"]),
+                    "avg_kg_per_piece": float(r["batch_avg_kg_per_piece"]),
+                    "pcs_on_hand": int(onhand["pcs"]),
+                    "kg_on_hand": float(onhand["kg"]),
+                }
+            )
+    return out
 
 
 def inventory_summary(conn):
