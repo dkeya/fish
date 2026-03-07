@@ -28,22 +28,58 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    # Create base schema (for new installs)
+    # Base schema (fresh installs)
     conn.executescript(SCHEMA_SQL)
 
     # ---- migrations for existing installs ----
-    # Add buy_price_per_kg to batches if missing
+
+    # batches.buy_price_per_kg
     if not _column_exists(conn, "batches", "buy_price_per_kg"):
         conn.execute("ALTER TABLE batches ADD COLUMN buy_price_per_kg REAL NOT NULL DEFAULT 0;")
 
-    # Add price_basis to sales if missing (needed for auto total price computation)
+    # batches.supplier_id
+    if not _column_exists(conn, "batches", "supplier_id"):
+        conn.execute("ALTER TABLE batches ADD COLUMN supplier_id INTEGER;")
+
+    # sales.price_basis
     if not _column_exists(conn, "sales", "price_basis"):
         conn.execute("ALTER TABLE sales ADD COLUMN price_basis TEXT NOT NULL DEFAULT 'PER_KG';")
+
+    # sales.customer_id
+    if not _column_exists(conn, "sales", "customer_id"):
+        conn.execute("ALTER TABLE sales ADD COLUMN customer_id INTEGER;")
+
+    # promo-related sales columns
+    if not _column_exists(conn, "sales", "promo_applied"):
+        conn.execute("ALTER TABLE sales ADD COLUMN promo_applied INTEGER NOT NULL DEFAULT 0;")
+
+    if not _column_exists(conn, "sales", "promo_code"):
+        conn.execute("ALTER TABLE sales ADD COLUMN promo_code TEXT;")
+
+    if not _column_exists(conn, "sales", "promo_name"):
+        conn.execute("ALTER TABLE sales ADD COLUMN promo_name TEXT;")
+
+    if not _column_exists(conn, "sales", "promo_buy_qty"):
+        conn.execute("ALTER TABLE sales ADD COLUMN promo_buy_qty INTEGER;")
+
+    if not _column_exists(conn, "sales", "promo_free_qty"):
+        conn.execute("ALTER TABLE sales ADD COLUMN promo_free_qty INTEGER;")
+
+    if not _column_exists(conn, "sales", "charged_pcs"):
+        conn.execute("ALTER TABLE sales ADD COLUMN charged_pcs INTEGER;")
+
+    if not _column_exists(conn, "sales", "free_pcs"):
+        conn.execute("ALTER TABLE sales ADD COLUMN free_pcs INTEGER NOT NULL DEFAULT 0;")
+
+    if not _column_exists(conn, "sales", "promo_discount_value"):
+        conn.execute("ALTER TABLE sales ADD COLUMN promo_discount_value REAL;")
 
     conn.commit()
 
 
 def q(conn: sqlite3.Connection, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+    if params is None:
+        params = ()
     cur = conn.execute(sql, tuple(params))
     rows = cur.fetchall()
     cur.close()
@@ -51,6 +87,8 @@ def q(conn: sqlite3.Connection, sql: str, params: Iterable[Any] = ()) -> list[sq
 
 
 def x(conn: sqlite3.Connection, sql: str, params: Iterable[Any] = ()) -> int:
+    if params is None:
+        params = ()
     cur = conn.execute(sql, tuple(params))
     conn.commit()
     last = cur.lastrowid
