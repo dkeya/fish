@@ -10,6 +10,7 @@ pages = [
     st.Page("pages/2_📦_Inventory.py", title="Inventory", icon="📦"),
     st.Page("pages/3_🛒_Sales.py", title="Sales", icon="🛒"),
     st.Page("pages/4_✅_Batch_Close_&_Loss.py", title="Batch Close & Loss", icon="✅"),
+    st.Page("pages/7_🔄_Stock_Transfer.py", title="Stock Transfer", icon="🔄"),
     st.Page("pages/5_🧪_Data_Management.py", title="Data Management", icon="🧪"),
     st.Page("pages/6_📊_Reports.py", title="Reports", icon="📊"),
 ]
