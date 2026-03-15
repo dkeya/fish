@@ -12,7 +12,7 @@ class BatchLineInput:
     size_id: int
     pieces: int
     kg: float
-    buy_price_per_kg: Optional[float] = None  # NEW: allow per-size price
+    buy_price_per_kg: Optional[float] = None  # allow per-size price
 
 
 def list_open_batches(conn):
@@ -39,8 +39,6 @@ def list_batch_lines(conn, batch_id: int):
 
 
 def _normalize_branch_code(branch_name: str) -> str:
-    # Simple predictable code: take first 3 letters of each word, joined.
-    # "Nairobi East" -> "NAIEAS"
     parts = [p for p in str(branch_name).strip().upper().split() if p]
     if not parts:
         return "BR"
@@ -61,6 +59,29 @@ def _get_size_code(conn, size_id: int) -> str:
     if not r:
         raise ValueError("Size not found.")
     return str(r[0]["code"]).strip().upper()
+
+
+def _get_supplier_id_by_name(conn, supplier_name: Optional[str]) -> Optional[int]:
+    if supplier_name is None:
+        return None
+
+    supplier_name = str(supplier_name).strip()
+    if not supplier_name:
+        return None
+
+    rows = q(
+        conn,
+        """
+        SELECT id
+        FROM suppliers
+        WHERE LOWER(name) = LOWER(?)
+        LIMIT 1
+        """,
+        (supplier_name,),
+    )
+    if not rows:
+        return None
+    return int(rows[0]["id"])
 
 
 def _generate_batch_code(conn, *, branch_id: int, size_id: int, receipt_date: str) -> str:
@@ -92,13 +113,15 @@ def create_batch(
     receipt_date: str,
     branch_id: int,
     supplier: Optional[str],
+    supplier_id: Optional[int] = None,
     notes: Optional[str],
     buy_price_per_kg: float,
     lines: list[BatchLineInput],
 ) -> int:
     """
-    Creates ONE batch (can still carry multiple lines, but FIFO-by-size works best when each
-    batch is size-specific: i.e., lines contains exactly one entry).
+    Creates ONE batch.
+    FIFO-by-size works best when each batch is size-specific
+    (i.e. lines contains exactly one entry).
     """
     if not batch_code:
         raise ValueError("Batch code is required.")
@@ -126,16 +149,17 @@ def create_batch(
         conn,
         """
         INSERT INTO batches (
-            batch_code, receipt_date, branch_id, supplier, notes,
+            batch_code, receipt_date, branch_id, supplier, supplier_id, notes,
             buy_price_per_kg,
             initial_pieces, initial_kg, batch_avg_kg_per_piece, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
         """,
         (
             batch_code,
             receipt_date,
             int(branch_id),
             supplier,
+            int(supplier_id) if supplier_id is not None else None,
             notes,
             float(buy_price_per_kg),
             int(total_pcs),
@@ -168,11 +192,13 @@ def create_batches_from_purchase(
     lines: list[BatchLineInput],
 ) -> list[int]:
     """
-    NEW: One purchase can generate MULTIPLE batches (one per fish size).
-    Each line becomes its own batch so buy_price_per_kg can differ per product/size.
+    One purchase can generate MULTIPLE batches (one per fish size).
+    Each line becomes its own batch so buy_price_per_kg can differ per size.
     """
     if not lines:
         raise ValueError("At least one size line is required.")
+
+    supplier_id = _get_supplier_id_by_name(conn, supplier)
 
     created_ids: list[int] = []
 
@@ -204,6 +230,7 @@ def create_batches_from_purchase(
             receipt_date=str(receipt_date),
             branch_id=int(branch_id),
             supplier=supplier,
+            supplier_id=supplier_id,
             notes=notes,
             buy_price_per_kg=float(bp),
             lines=[BatchLineInput(size_id=int(l.size_id), pieces=pcs, kg=kg)],
