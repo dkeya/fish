@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import streamlit as st
+import io
+
 import pandas as pd
+import streamlit as st
 
 from core.config import get_settings
 from core.db import get_conn, ensure_schema, q
@@ -22,6 +24,18 @@ ensure_schema(conn)
 branches = q(conn, "SELECT id, name FROM branches ORDER BY name")
 sizes = q(conn, "SELECT id, code, description FROM sizes ORDER BY sort_order")
 suppliers = q(conn, "SELECT id, name FROM suppliers WHERE is_active=1 ORDER BY name")
+
+# -------------------------
+# Session state / role handling
+# -------------------------
+current_role = (
+    st.session_state.get("user_role")
+    or st.session_state.get("erp_role")
+    or "Admin"
+)
+is_admin = str(current_role).strip().lower() == "admin"
+
+user_branch_id = st.session_state.get("user_branch_id")
 
 # -------------------------
 # Session state for cart / submission guard
@@ -47,8 +61,8 @@ def _cart_to_df(cart: list[dict]) -> pd.DataFrame:
                 "Line": i,
                 "Size": item["size_code"],
                 "Pieces": int(item["pieces"]),
-                "Kg": float(item["kg"]),
-                "BuyPrice/kg": float(item["buy_price_per_kg"]),
+                "Kg": round(float(item["kg"]), 3),
+                "Buy Price / Kg": round(float(item["buy_price_per_kg"]), 2),
                 "Line Total": round(line_total, 2),
             }
         )
@@ -59,6 +73,89 @@ def _cart_total(cart: list[dict]) -> float:
     return round(sum(float(i["kg"]) * float(i["buy_price_per_kg"]) for i in cart), 2)
 
 
+def _build_summary_text(
+    *,
+    branch_name: str,
+    supplier_name: str,
+    receipt_date: str,
+    notes: str,
+    cart_df: pd.DataFrame,
+    total_pieces: int,
+    total_kg: float,
+    total_value: float,
+) -> str:
+    lines = [
+        "STOCK-IN PURCHASE SUMMARY",
+        "=========================",
+        f"Branch: {branch_name}",
+        f"Supplier: {supplier_name}",
+        f"Receipt Date: {receipt_date}",
+        "",
+        "LINES",
+        "-----",
+    ]
+
+    for _, row in cart_df.iterrows():
+        lines.append(
+            f"Line {int(row['Line'])}: {row['Size']} | "
+            f"Pieces={int(row['Pieces'])} | "
+            f"Kg={float(row['Kg']):.3f} | "
+            f"BuyPrice/Kg={float(row['Buy Price / Kg']):,.2f} | "
+            f"Line Total={float(row['Line Total']):,.2f}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "TOTALS",
+            "------",
+            f"Total Pieces: {total_pieces}",
+            f"Total Kg: {total_kg:.3f}",
+            f"Tentative Total Value: KES {total_value:,.2f}",
+        ]
+    )
+
+    if notes.strip():
+        lines.extend(["", f"Notes: {notes.strip()}"])
+
+    return "\n".join(lines)
+
+
+def _get_procurement_rule(branch_id: int) -> dict:
+    rows = q(
+        conn,
+        """
+        SELECT
+            bpr.can_purchase_direct,
+            bpr.can_receive_transfer,
+            bpr.default_source_branch_id,
+            bpr.notes,
+            src.name AS default_source_branch_name
+        FROM branch_procurement_rules bpr
+        LEFT JOIN branches src ON src.id = bpr.default_source_branch_id
+        WHERE bpr.branch_id=?
+        """,
+        (int(branch_id),),
+    )
+    if not rows:
+        return {
+            "can_purchase_direct": 1,
+            "can_receive_transfer": 1,
+            "default_source_branch_id": None,
+            "default_source_branch_name": None,
+            "notes": None,
+        }
+
+    r = rows[0]
+    return {
+        "can_purchase_direct": int(r["can_purchase_direct"]),
+        "can_receive_transfer": int(r["can_receive_transfer"]),
+        "default_source_branch_id": int(r["default_source_branch_id"]) if r["default_source_branch_id"] is not None else None,
+        "default_source_branch_name": str(r["default_source_branch_name"]) if r["default_source_branch_name"] is not None else None,
+        "notes": str(r["notes"]) if r["notes"] is not None else None,
+    }
+
+
 # -------------------------
 # Reference lookups
 # -------------------------
@@ -66,33 +163,94 @@ branch_name_to_id = {str(b["name"]): int(b["id"]) for b in branches}
 size_code_to_id = {str(s["code"]): int(s["id"]) for s in sizes}
 supplier_names = [str(s["name"]) for s in suppliers]
 
+# Branch selector logic
+if user_branch_id and not is_admin:
+    assigned_branch = next((b for b in branches if int(b["id"]) == int(user_branch_id)), None)
+    if not assigned_branch:
+        st.error("Assigned branch not found.")
+        st.stop()
+    selected_branch_name = str(assigned_branch["name"])
+    selected_branch_id = int(assigned_branch["id"])
+else:
+    selected_branch_name = None
+    selected_branch_id = None
+
 col1, col2 = st.columns([1.15, 1], gap="large")
 
 with col1:
     st.subheader("Create stock-in (cart-style entry)")
 
     receipt_date = st.date_input("Receipt date")
-    branch_name = st.selectbox("Branch", options=list(branch_name_to_id.keys()))
+
+    if selected_branch_name is not None:
+        st.selectbox("Branch", options=[selected_branch_name], index=0, disabled=True)
+        branch_name = selected_branch_name
+        branch_id = int(selected_branch_id)
+    else:
+        branch_name = st.selectbox("Branch", options=list(branch_name_to_id.keys()))
+        branch_id = int(branch_name_to_id[branch_name])
+
+    procurement_rule = _get_procurement_rule(int(branch_id))
+    can_purchase_direct = bool(procurement_rule["can_purchase_direct"])
+    can_receive_transfer = bool(procurement_rule["can_receive_transfer"])
+    default_source_branch_name = procurement_rule["default_source_branch_name"]
+    procurement_notes = procurement_rule["notes"] or ""
+
+    if is_admin:
+        st.info("Admin override: direct stock-in is allowed.")
+    else:
+        if can_purchase_direct:
+            st.success("This branch is allowed to purchase directly into stock.")
+        else:
+            msg = "This branch is not allowed to purchase directly."
+            if default_source_branch_name:
+                msg += f" Default source branch: {default_source_branch_name}."
+            st.warning(msg)
+            if can_receive_transfer:
+                st.info("Use stock transfer / replenishment from the approved source branch.")
+            if procurement_notes:
+                st.caption(f"Rule note: {procurement_notes}")
+
     supplier_name = st.selectbox(
         "Supplier",
         options=supplier_names if supplier_names else ["No suppliers configured"],
-        disabled=(len(supplier_names) == 0),
+        disabled=(len(supplier_names) == 0 or (not is_admin and not can_purchase_direct)),
         help="Suppliers are pre-configured to avoid duplicates and typing errors.",
     )
-    notes = st.text_area("Notes (optional)", value="", height=80)
+    notes = st.text_area("Notes (optional)", value="", height=80, disabled=(not is_admin and not can_purchase_direct))
 
     st.markdown("**Add one line at a time**")
 
     add_c1, add_c2, add_c3, add_c4 = st.columns([1, 1, 1, 1], gap="small")
 
     with add_c1:
-        size_code = st.selectbox("Size", options=list(size_code_to_id.keys()), key="stockin_size")
+        size_code = st.selectbox(
+            "Size",
+            options=list(size_code_to_id.keys()),
+            key="stockin_size",
+            disabled=(not is_admin and not can_purchase_direct),
+        )
 
     with add_c2:
-        pieces = st.number_input("Pieces", min_value=1, value=1, step=1, key="stockin_pieces")
+        pieces = st.number_input(
+            "Pieces",
+            min_value=1,
+            value=1,
+            step=1,
+            key="stockin_pieces",
+            disabled=(not is_admin and not can_purchase_direct),
+        )
 
     with add_c3:
-        kg = st.number_input("Kg", min_value=0.001, value=1.000, step=0.1, format="%.3f", key="stockin_kg")
+        kg = st.number_input(
+            "Kg",
+            min_value=0.001,
+            value=1.000,
+            step=0.1,
+            format="%.3f",
+            key="stockin_kg",
+            disabled=(not is_admin and not can_purchase_direct),
+        )
 
     with add_c4:
         buy_price_per_kg = st.number_input(
@@ -102,12 +260,18 @@ with col1:
             step=1.0,
             key="stockin_bp",
             help="Captured per size line for clean valuation and margin tracking.",
+            disabled=(not is_admin and not can_purchase_direct),
         )
 
     add_line_col1, add_line_col2 = st.columns([1, 1])
 
     with add_line_col1:
-        if st.button("Add Line to Cart", type="secondary", use_container_width=True):
+        if st.button(
+            "Add Line to Cart",
+            type="secondary",
+            use_container_width=True,
+            disabled=(not is_admin and not can_purchase_direct),
+        ):
             try:
                 if float(buy_price_per_kg) <= 0:
                     raise ValueError("Buy price/kg must be greater than 0.")
@@ -155,18 +319,56 @@ with col1:
                 del st.session_state["stock_in_cart"][idx]
                 st.rerun()
 
+        summary_text = _build_summary_text(
+            branch_name=branch_name,
+            supplier_name=supplier_name,
+            receipt_date=receipt_date.isoformat(),
+            notes=notes,
+            cart_df=cart_df,
+            total_pieces=total_pieces,
+            total_kg=total_kg,
+            total_value=total_value,
+        )
+
         with st.expander("Purchase Summary Preview", expanded=True):
             st.markdown("**Purchase summary (preview before final confirmation)**")
-            summary_df = cart_df.copy()
-            st.dataframe(summary_df, use_container_width=True, hide_index=True)
             st.write(f"**Branch:** {branch_name}")
             st.write(f"**Supplier:** {supplier_name}")
             st.write(f"**Receipt date:** {receipt_date.isoformat()}")
             if notes.strip():
                 st.write(f"**Notes:** {notes.strip()}")
-            st.write(f"**Tentative total value:** KES {total_value:,.2f}")
 
-        finalize_disabled = st.session_state["stock_in_submitted"] or len(cart) == 0 or len(supplier_names) == 0
+            st.dataframe(cart_df, use_container_width=True, hide_index=True)
+            st.write(f"**Total Pieces:** {total_pieces}")
+            st.write(f"**Total Kg:** {total_kg:,.3f}")
+            st.write(f"**Tentative Total Value:** KES {total_value:,.2f}")
+
+            csv_buffer = io.StringIO()
+            cart_df.to_csv(csv_buffer, index=False)
+
+            st.download_button(
+                "Download Purchase Summary (CSV)",
+                data=csv_buffer.getvalue(),
+                file_name=f"stock_in_summary_{receipt_date.isoformat()}_{branch_name.replace(' ', '_')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+            st.download_button(
+                "Download Purchase Summary (TXT)",
+                data=summary_text,
+                file_name=f"stock_in_summary_{receipt_date.isoformat()}_{branch_name.replace(' ', '_')}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+        finalize_disabled = (
+            st.session_state["stock_in_submitted"]
+            or len(cart) == 0
+            or len(supplier_names) == 0
+            or (not is_admin and not can_purchase_direct)
+        )
+
         if st.button(
             "Create Stock-In (Auto Batches)",
             type="primary",
@@ -174,9 +376,10 @@ with col1:
             disabled=finalize_disabled,
         ):
             try:
-                st.session_state["stock_in_submitted"] = True
+                if not is_admin and not can_purchase_direct:
+                    raise ValueError("This branch is not allowed to purchase directly. Use transfer from the approved source branch.")
 
-                br_id = int(branch_name_to_id[branch_name])
+                st.session_state["stock_in_submitted"] = True
 
                 lines = [
                     BatchLineInput(
@@ -191,18 +394,16 @@ with col1:
                 created = create_batches_from_purchase(
                     conn,
                     receipt_date=receipt_date.isoformat(),
-                    branch_id=br_id,
+                    branch_id=int(branch_id),
                     supplier=supplier_name.strip() if supplier_name else None,
                     notes=notes.strip() or None,
                     lines=lines,
                 )
 
-                # Clear cart immediately to prevent accidental repeat submission
                 created_count = len(created)
                 _reset_stock_in_state()
                 st.success(f"Stock-In saved successfully. {created_count} batch(es) created.")
 
-                # Exit screen / redirect away after save
                 try:
                     st.switch_page("home.py")
                 except Exception:
@@ -212,7 +413,10 @@ with col1:
                 st.session_state["stock_in_submitted"] = False
                 st.error(str(e))
     else:
-        st.info("No lines added yet. Add sizes to the cart first.")
+        if not is_admin and not can_purchase_direct:
+            st.info("Direct stock-in is disabled for this branch under the current procurement rule.")
+        else:
+            st.info("No lines added yet. Add sizes to the cart first.")
 
 with col2:
     st.subheader("Recent open batches")

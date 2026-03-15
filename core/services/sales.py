@@ -161,6 +161,48 @@ def _fifo_batches_for_size(conn, *, branch_id: int, size_id: int) -> list[dict]:
     return out
 
 
+def _get_negative_fallback_batch(conn, *, branch_id: int, size_id: int) -> Optional[dict]:
+    """
+    When stock is insufficient but sales must continue, use the most recent matching batch
+    as the negative-stock fallback. This allows the system to post the sale now and the
+    next stock movement can operationally offset the balance later.
+    """
+    rows = q(
+        conn,
+        """
+        SELECT
+          b.id AS batch_id,
+          b.batch_code,
+          b.receipt_date,
+          b.status,
+          b.batch_avg_kg_per_piece
+        FROM batches b
+        JOIN batch_lines bl ON bl.batch_id = b.id
+        WHERE b.branch_id=?
+          AND bl.size_id=?
+        ORDER BY
+          CASE WHEN b.status='OPEN' THEN 0 ELSE 1 END,
+          b.receipt_date DESC,
+          b.id DESC
+        LIMIT 1
+        """,
+        (int(branch_id), int(size_id)),
+    )
+    if not rows:
+        return None
+
+    r = rows[0]
+    return {
+        "batch_id": int(r["batch_id"]),
+        "batch_code": str(r["batch_code"]),
+        "receipt_date": str(r["receipt_date"]),
+        "avg_kg_per_piece": float(r["batch_avg_kg_per_piece"]),
+        "pcs_on_hand": 0,
+        "kg_on_hand": 0.0,
+        "status": str(r["status"]),
+    }
+
+
 def get_branch_size_prices(conn, *, branch_id: int, size_id: int) -> dict:
     rows = q(
         conn,
@@ -273,14 +315,6 @@ def calculate_retail_promo_summary(
 
 
 def _free_pcs_in_interval(start_pos: int, end_pos: int, *, buy_qty: int, free_qty: int) -> int:
-    """
-    Sequence-based free-piece allocation across FIFO rows.
-    Example Buy 2 Get 1:
-      positions 1,2 charged
-      position 3 free
-      positions 4,5 charged
-      position 6 free
-    """
     if end_pos < start_pos:
         return 0
 
@@ -480,14 +514,8 @@ def create_retail_sale_fifo(
     kg_sold_actual: float,
     unit_price: Optional[float],
     tolerance_weight_ratio: float = 0.20,
+    allow_negative_stock: bool = False,
 ) -> list[SaleResult]:
-    """
-    Retail:
-    - pricing is PER_PIECE
-    - salesperson inputs pieces + actual kg
-    - actual kg is allocated proportionally across FIFO rows
-    - active branch promo (if any) is automatically applied
-    """
     if int(pcs_sold) <= 0:
         raise ValueError("Pieces sold must be > 0.")
     if float(kg_sold_actual) <= 0:
@@ -496,11 +524,13 @@ def create_retail_sale_fifo(
         raise ValueError("Retail unit price is required.")
 
     fifo = _fifo_batches_for_size(conn, branch_id=int(branch_id), size_id=int(size_id))
-    if not fifo:
-        raise ValueError("No stock available for this size (FIFO).")
+    fallback_batch = _get_negative_fallback_batch(conn, branch_id=int(branch_id), size_id=int(size_id))
+
+    if not fifo and not (allow_negative_stock and fallback_batch):
+        raise ValueError("No stock available for this size.")
 
     remaining_pcs = int(pcs_sold)
-    allocations: list[tuple[dict, int, float]] = []  # batch, pcs, expected_kg
+    allocations: list[tuple[dict, int, float]] = []
 
     for b in fifo:
         if remaining_pcs <= 0:
@@ -515,7 +545,13 @@ def create_retail_sale_fifo(
         remaining_pcs -= int(take_pcs)
 
     if remaining_pcs > 0:
-        raise ValueError("Not enough pieces on hand across FIFO batches for this size.")
+        if not allow_negative_stock:
+            raise ValueError("Not enough pieces on hand across FIFO batches for this size.")
+        if not fallback_batch:
+            raise ValueError("Negative stock sale requested, but no historical batch exists for this size.")
+        expected_kg = float(remaining_pcs) * float(fallback_batch["avg_kg_per_piece"])
+        allocations.append((fallback_batch, int(remaining_pcs), float(expected_kg)))
+        remaining_pcs = 0
 
     total_expected_kg = sum(exp_kg for _, _, exp_kg in allocations)
     if total_expected_kg <= 0:
@@ -530,14 +566,7 @@ def create_retail_sale_fifo(
 
     results: list[SaleResult] = []
     kg_remaining = float(kg_sold_actual)
-
-    # Allocate promo free/charged pieces by FIFO sequence positions
     cursor_start = 1
-
-    total_free_alloc = 0
-    total_charged_alloc = 0
-    total_discount_alloc = 0.0
-    total_price_alloc = 0.0
 
     for i, (b, take_pcs, expected_kg) in enumerate(allocations):
         if i < len(allocations) - 1:
@@ -573,11 +602,6 @@ def create_retail_sale_fifo(
             row_promo_applied = 1 if row_free_pcs > 0 else 0
             cursor_start = row_end + 1
 
-            total_free_alloc += int(row_free_pcs)
-            total_charged_alloc += int(row_charged_pcs)
-            total_discount_alloc = round(total_discount_alloc + row_discount, 2)
-            total_price_alloc = round(total_price_alloc + row_total_price, 2)
-
         res = create_retail_sale(
             conn,
             branch_id=int(branch_id),
@@ -602,11 +626,6 @@ def create_retail_sale_fifo(
         )
         results.append(res)
 
-    # sanity adjustment for no-promo case
-    if promo_summary["promo_applied"] == 0:
-        # rows were already written as full charge rows
-        pass
-
     return results
 
 
@@ -621,13 +640,8 @@ def create_wholesale_sale_fifo(
     pcs_counted: int,
     tolerance_pcs: int = 2,
     unit_price: Optional[float] = None,
+    allow_negative_stock: bool = False,
 ) -> list[SaleResult]:
-    """
-    Wholesale:
-    - pricing is PER_KG
-    - salesperson inputs kg + counted pieces
-    - counted pieces are allocated across FIFO rows in a controlled way
-    """
     if float(kg_sold) <= 0:
         raise ValueError("Kg sold must be > 0.")
     if int(pcs_counted) <= 0:
@@ -636,8 +650,10 @@ def create_wholesale_sale_fifo(
     tol = max(0, int(tolerance_pcs))
 
     fifo = _fifo_batches_for_size(conn, branch_id=int(branch_id), size_id=int(size_id))
-    if not fifo:
-        raise ValueError("No stock available for this size (FIFO).")
+    fallback_batch = _get_negative_fallback_batch(conn, branch_id=int(branch_id), size_id=int(size_id))
+
+    if not fifo and not (allow_negative_stock and fallback_batch):
+        raise ValueError("No stock available for this size.")
 
     remaining_kg = float(kg_sold)
     allocations: list[tuple[dict, float]] = []
@@ -652,7 +668,12 @@ def create_wholesale_sale_fifo(
         remaining_kg -= float(take_kg)
 
     if remaining_kg > 1e-6:
-        raise ValueError("Not enough kg on hand across FIFO batches for this size.")
+        if not allow_negative_stock:
+            raise ValueError("Not enough kg on hand across FIFO batches for this size.")
+        if not fallback_batch:
+            raise ValueError("Negative stock sale requested, but no historical batch exists for this size.")
+        allocations.append((fallback_batch, float(remaining_kg)))
+        remaining_kg = 0.0
 
     if int(pcs_counted) < len(allocations):
         raise ValueError(
